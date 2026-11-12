@@ -21,6 +21,7 @@ import (
 	"fmt"
 	weakrand "math/rand/v2"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 
@@ -44,16 +45,15 @@ type HTTPBasicAuth struct {
 	// The name of the realm. Default: restricted
 	Realm string `json:"realm,omitempty"`
 
-	// If non-nil, a mapping of plaintext passwords to their
-	// hashes will be cached in memory (with random eviction).
+	// If non-nil, successful password comparisons will be
+	// cached in memory (with random eviction).
 	// This can greatly improve the performance of traffic-heavy
 	// servers that use secure password hashing algorithms, with
 	// the downside that plaintext passwords will be stored in
 	// memory for a longer time (this should not be a problem
 	// as long as your machine is not compromised, at which point
 	// all bets are off, since basicauth necessitates plaintext
-	// passwords being received over the wire anyway). Note that
-	// a cache hit does not mean it is a valid password.
+	// passwords being received over the wire anyway).
 	HashCache *Cache `json:"hash_cache,omitempty"`
 
 	Accounts map[string]Account `json:"-"`
@@ -102,12 +102,12 @@ func (hba *HTTPBasicAuth) Provision(ctx caddy.Context) error {
 	// load account list
 	hba.Accounts = make(map[string]Account)
 	for i, acct := range hba.AccountList {
+		acct.Username = repl.ReplaceKnown(acct.Username, "")
+		acct.Password = repl.ReplaceKnown(acct.Password, "")
+
 		if _, ok := hba.Accounts[acct.Username]; ok {
 			return fmt.Errorf("account %d: username is not unique: %s", i, acct.Username)
 		}
-
-		acct.Username = repl.ReplaceKnown(acct.Username, "")
-		acct.Password = repl.ReplaceKnown(acct.Password, "")
 
 		if acct.Username == "" || acct.Password == "" {
 			return fmt.Errorf("account %d: username and password are required", i)
@@ -152,6 +152,7 @@ func (hba HTTPBasicAuth) Authenticate(w http.ResponseWriter, req *http.Request) 
 		// to try to avoid side-channels that leak existence, so
 		// we use a fake password to simulate realistic CPU cycles
 		account.password = hba.fakePassword
+		account.Username = username
 	}
 
 	same, err := hba.correctPassword(account, []byte(plaintextPasswordStr))
@@ -173,7 +174,9 @@ func (hba HTTPBasicAuth) correctPassword(account Account, plaintextPassword []by
 	}
 
 	// compute a cache key that is unique for these input parameters
-	cacheKey := hex.EncodeToString(append(account.password, plaintextPassword...))
+	// (build it in a new buffer: appending to account.password could write
+	// into its spare capacity, which is shared by all concurrent requests)
+	cacheKey := account.Username + ":" + hex.EncodeToString(slices.Concat(account.password, plaintextPassword))
 
 	// fast track: if the result of the input is already cached, use it
 	hba.HashCache.mu.RLock()
@@ -194,6 +197,10 @@ func (hba HTTPBasicAuth) correctPassword(account Account, plaintextPassword []by
 		return false, err
 	}
 	same = v.(bool)
+	// Failed comparisons must remain expensive for both real and missing accounts.
+	if !same {
+		return false, nil
+	}
 	hba.HashCache.mu.Lock()
 	if len(hba.HashCache.cache) >= 1000 {
 		hba.HashCache.makeRoom() // keep cache size under control
@@ -216,14 +223,14 @@ func (hba HTTPBasicAuth) promptForCredentials(w http.ResponseWriter, err error) 
 	return User{}, false, err
 }
 
-// Cache enables caching of basic auth results. This is especially
+// Cache enables caching of successful basic auth comparisons. This is especially
 // helpful for secure password hashes which can be expensive to
 // compute on every HTTP request.
 type Cache struct {
 	mu *sync.RWMutex
 	g  *singleflight.Group
 
-	// map of concatenated hashed password + plaintext password, to result
+	// map of username + ":" + hex(hashed password + plaintext password), to result
 	cache map[string]bool
 }
 
@@ -278,6 +285,25 @@ type Comparer interface {
 type Hasher interface {
 	Hash(plaintext []byte) ([]byte, error)
 	FakeHash() []byte
+}
+
+// hashesNamespace is the module namespace of password hashing modules.
+const hashesNamespace = "http.authentication.hashes"
+
+// hashModuleInfo returns the module info of the installed password
+// hashing module with the given name (e.g. "bcrypt"). If no such module
+// is installed, the returned error lists the available algorithms.
+func hashModuleInfo(name string) (caddy.ModuleInfo, error) {
+	mods := caddy.GetModules(hashesNamespace)
+	names := make([]string, 0, len(mods))
+	for _, mod := range mods {
+		if mod.ID.Name() == name {
+			return mod, nil
+		}
+		names = append(names, mod.ID.Name())
+	}
+	return caddy.ModuleInfo{}, fmt.Errorf("unrecognized hash algorithm: %s (available: %s)",
+		name, strings.Join(names, ", "))
 }
 
 // Account contains a username and password.

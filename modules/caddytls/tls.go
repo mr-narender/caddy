@@ -255,9 +255,10 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 	// commands like validate can be a better test
 	certCacheMu.RLock()
 	magic := certmagic.New(certCache, certmagic.Config{
-		Storage: ctx.Storage(),
-		Logger:  t.logger,
-		OnEvent: t.onEvent,
+		Storage:        ctx.Storage(),
+		Logger:         t.logger,
+		OnEvent:        t.onEvent,
+		ShouldEmitFunc: t.events.ShouldEmit,
 		OCSP: certmagic.OCSPConfig{
 			DisableStapling: t.DisableOCSPStapling,
 		},
@@ -903,6 +904,10 @@ func (t *TLS) getConfigForName(name string) *certmagic.Config {
 // default policy is used, depending on whether the name qualifies for a
 // public certificate or not.
 func (t *TLS) getAutomationPolicyForName(name string) *AutomationPolicy {
+	// Match the name CertMagic will use for issuance and caching, not the raw SNI.
+	if normalized, err := normalizeAutomationSubject(strings.TrimSpace(name)); err == nil {
+		name = normalized
+	}
 	for _, ap := range t.Automation.Policies {
 		if len(ap.subjects) == 0 {
 			return ap // no host filter is an automatic match
