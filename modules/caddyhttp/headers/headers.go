@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
@@ -136,6 +137,19 @@ func (ops *HeaderOps) Provision(_ caddy.Context) error {
 	if ops == nil {
 		return nil // it's possible no ops are configured; fix #6893
 	}
+	if len(ops.Set) > 0 {
+		set := make(http.Header, len(ops.Set))
+		var fields []string
+		for fieldName := range ops.Set {
+			fields = append(fields, fieldName)
+		}
+		sort.Strings(fields)
+		for _, fieldName := range fields {
+			canonical := http.CanonicalHeaderKey(fieldName)
+			set[canonical] = append(set[canonical], ops.Set[fieldName]...)
+		}
+		ops.Set = set
+	}
 	for fieldName, replacements := range ops.Replace {
 		for i, r := range replacements {
 			if r.SearchRegexp == "" {
@@ -191,7 +205,8 @@ type Replacement struct {
 	// The substring to search for.
 	Search string `json:"search,omitempty"`
 
-	// The regular expression to search with.
+	// The regular expression to search with. Placeholder-dependent expressions
+	// are compiled once per operation; invalid expanded expressions are skipped.
 	SearchRegexp string `json:"search_regexp,omitempty"`
 
 	// The string with which to replace matches.
@@ -242,12 +257,19 @@ func (ops *HeaderOps) ApplyTo(hdr http.Header, repl *caddy.Replacer) {
 
 	// set
 	for fieldName, vals := range ops.Set {
-		fieldName = repl.ReplaceKnown(fieldName, "")
-		var newVals []string
+		if expanded := repl.ReplaceKnown(fieldName, ""); expanded != fieldName {
+			fieldName = http.CanonicalHeaderKey(expanded)
+		}
+		newVals := make([]string, len(vals))
 		for i := range vals {
-			// append to new slice so we don't overwrite
-			// the original values in ops.Set
-			newVals = append(newVals, repl.ReplaceKnown(vals[i], ""))
+			newVals[i] = repl.ReplaceKnown(vals[i], "")
+		}
+		if fieldName == "Set-Cookie" && len(newVals) > 1 {
+			hdr.Del(fieldName)
+			for _, val := range newVals {
+				hdr.Add(fieldName, val)
+			}
+			continue
 		}
 		hdr.Set(fieldName, strings.Join(newVals, ","))
 	}
@@ -286,49 +308,25 @@ func (ops *HeaderOps) ApplyTo(hdr http.Header, repl *caddy.Replacer) {
 	for fieldName, replacements := range ops.Replace {
 		fieldName = http.CanonicalHeaderKey(repl.ReplaceKnown(fieldName, ""))
 
-		// all fields...
-		if fieldName == "*" {
-			for _, r := range replacements {
-				search := repl.ReplaceKnown(r.Search, "")
-				replace := repl.ReplaceKnown(r.Replace, "")
-				for fieldName, vals := range hdr {
-					for i := range vals {
-						if r.re != nil {
-							// Use precompiled regular expressions
-							hdr[fieldName][i] = r.re.ReplaceAllString(hdr[fieldName][i], replace)
-						} else if r.SearchRegexp != "" {
-							// Runtime compilation of regular expressions
-							searchRegexp := repl.ReplaceKnown(r.SearchRegexp, "")
-							if re, err := regexp.Compile(searchRegexp); err == nil {
-								hdr[fieldName][i] = re.ReplaceAllString(hdr[fieldName][i], replace)
-							}
-							// If compilation fails, skip this replacement
-						} else {
-							hdr[fieldName][i] = strings.ReplaceAll(hdr[fieldName][i], search, replace)
-						}
-					}
-				}
-			}
-			continue
-		}
-
-		// ...or only with the named field
 		for _, r := range replacements {
 			search := repl.ReplaceKnown(r.Search, "")
 			replace := repl.ReplaceKnown(r.Replace, "")
+			re := r.re
+			if re == nil && r.SearchRegexp != "" {
+				var err error
+				re, err = regexp.Compile(repl.ReplaceKnown(r.SearchRegexp, ""))
+				if err != nil {
+					continue
+				}
+			}
 			for hdrFieldName, vals := range hdr {
 				// see issue #4330 for why we don't simply use hdr[fieldName]
-				if http.CanonicalHeaderKey(hdrFieldName) != fieldName {
+				if fieldName != "*" && http.CanonicalHeaderKey(hdrFieldName) != fieldName {
 					continue
 				}
 				for i := range vals {
-					if r.re != nil {
-						hdr[hdrFieldName][i] = r.re.ReplaceAllString(hdr[hdrFieldName][i], replace)
-					} else if r.SearchRegexp != "" {
-						searchRegexp := repl.ReplaceKnown(r.SearchRegexp, "")
-						if re, err := regexp.Compile(searchRegexp); err == nil {
-							hdr[hdrFieldName][i] = re.ReplaceAllString(hdr[hdrFieldName][i], replace)
-						}
+					if re != nil {
+						hdr[hdrFieldName][i] = re.ReplaceAllString(hdr[hdrFieldName][i], replace)
 					} else {
 						hdr[hdrFieldName][i] = strings.ReplaceAll(hdr[hdrFieldName][i], search, replace)
 					}
