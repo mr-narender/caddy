@@ -60,6 +60,122 @@ func TestConnectionPolicyIDNSNIMatcherFastPath(t *testing.T) {
 	}
 }
 
+// sniPolicy returns an unprovisioned connection policy that matches the
+// given server names, configured the same way as one decoded from JSON.
+func sniPolicy(names ...string) *ConnectionPolicy {
+	raw, err := json.Marshal(names)
+	if err != nil {
+		panic(err)
+	}
+	return &ConnectionPolicy{MatchersRaw: caddy.ModuleMap{"sni": raw}}
+}
+
+func TestConnectionPolicySNIFastPathKeepsFirstMatch(t *testing.T) {
+	ctx, err := caddy.ProvisionContext(&caddy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// each case puts a policy ahead of the exact-SNI policy for
+	// "site.localhost"; with more than 30 provisioned policies the SNI
+	// fast-path index is used, and it must still select the same policy
+	// a linear scan would
+	for i, tc := range []struct {
+		first     *ConnectionPolicy
+		wantFirst bool
+	}{
+		{
+			// catch-all drop ahead of the exact-SNI policy
+			first: &ConnectionPolicy{
+				MatchersRaw: caddy.ModuleMap{"remote_ip": json.RawMessage(`{"ranges":["0.0.0.0/0","::/0"]}`)},
+				Drop:        true,
+			},
+			wantFirst: true,
+		},
+		{
+			// wildcard-SNI policy ahead of the exact-SNI policy
+			first:     sniPolicy("*.localhost"),
+			wantFirst: true,
+		},
+		{
+			// placeholder-SNI policy ahead of the exact-SNI policy
+			first:     sniPolicy("{env.CADDY_TEST_UNSET}site.localhost"),
+			wantFirst: true,
+		},
+		{
+			// unrelated exact-SNI policy ahead of the exact-SNI policy
+			first:     sniPolicy("other.localhost"),
+			wantFirst: false,
+		},
+	} {
+		policies := ConnectionPolicies{tc.first}
+		for j := range 30 {
+			policies = append(policies, sniPolicy(fmt.Sprintf("example-%d.localhost", j)))
+		}
+		site := sniPolicy("site.localhost")
+		policies = append(policies, site, &ConnectionPolicy{})
+		if err := policies.Provision(ctx); err != nil {
+			t.Fatalf("Test %d: provisioning policies: %v", i, err)
+		}
+		if _, ok := site.matchers[0].(*MatchServerName); !ok {
+			t.Fatalf("Test %d: expected provisioned SNI matcher to be *MatchServerName, got %T", i, site.matchers[0])
+		}
+
+		hello := &tls.ClientHelloInfo{
+			ServerName: "site.localhost",
+			Conn:       testConn{addr: testAddr("198.51.100.1:443")},
+		}
+		got, err := policies.TLSConfig(ctx).GetConfigForClient(hello)
+		switch {
+		case tc.first.Drop:
+			if err == nil {
+				t.Errorf("Test %d: expected the first policy to drop the connection, got a config", i)
+			}
+		case err != nil:
+			t.Errorf("Test %d: unexpected error: %v", i, err)
+		case tc.wantFirst && got != tc.first.TLSConfig:
+			t.Errorf("Test %d: indexed lookup skipped the earlier matching policy", i)
+		case !tc.wantFirst && got != site.TLSConfig:
+			t.Errorf("Test %d: indexed lookup did not select the exact-SNI policy", i)
+		}
+	}
+}
+
+func BenchmarkConnectionPolicySNIFastPath(b *testing.B) {
+	ctx, err := caddy.ProvisionContext(&caddy.Config{})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	for _, n := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprintf("policies=%d", n), func(b *testing.B) {
+			// one exact-SNI policy per site followed by a catch-all, which
+			// is the shape the Caddyfile adapter produces for many sites
+			policies := make(ConnectionPolicies, 0, n+1)
+			for i := range n {
+				policies = append(policies, sniPolicy(fmt.Sprintf("site-%d.localhost", i)))
+			}
+			policies = append(policies, &ConnectionPolicy{})
+			if err := policies.Provision(ctx); err != nil {
+				b.Fatal(err)
+			}
+			getConfigForClient := policies.TLSConfig(ctx).GetConfigForClient
+
+			// the last site is the worst case for a linear scan
+			hello := &tls.ClientHelloInfo{ServerName: fmt.Sprintf("site-%d.localhost", n-1)}
+			want := policies[n-1].TLSConfig
+
+			b.ReportAllocs()
+			for b.Loop() {
+				got, err := getConfigForClient(hello)
+				if err != nil || got != want {
+					b.Fatalf("selected wrong policy: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestClientAuthenticationUnmarshalCaddyfileWithDirectiveName(t *testing.T) {
 	const test_der_1 = `MIIDSzCCAjOgAwIBAgIUfIRObjWNUA4jxQ/0x8BOCvE2Vw4wDQYJKoZIhvcNAQELBQAwFjEUMBIGA1UEAwwLRWFzeS1SU0EgQ0EwHhcNMTkwODI4MTYyNTU5WhcNMjkwODI1MTYyNTU5WjAWMRQwEgYDVQQDDAtFYXN5LVJTQSBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAK5m5elxhQfMp/3aVJ4JnpN9PUSz6LlP6LePAPFU7gqohVVFVtDkChJAG3FNkNQNlieVTja/bgH9IcC6oKbROwdY1h0MvNV8AHHigvl03WuJD8g2ReVFXXwsnrPmKXCFzQyMI6TYk3m2gYrXsZOU1GLnfMRC3KAMRgE2F45twOs9hqG169YJ6mM2eQjzjCHWI6S2/iUYvYxRkCOlYUbLsMD/AhgAf1plzg6LPqNxtdlwxZnA0ytgkmhK67HtzJu0+ovUCsMv0RwcMhsEo9T8nyFAGt9XLZ63X5WpBCTUApaAUhnG0XnerjmUWb6eUWw4zev54sEfY5F3x002iQaW6cECAwEAAaOBkDCBjTAdBgNVHQ4EFgQU4CBUbZsS2GaNIkGRz/cBsD5ivjswUQYDVR0jBEowSIAU4CBUbZsS2GaNIkGRz/cBsD5ivjuhGqQYMBYxFDASBgNVBAMMC0Vhc3ktUlNBIENBghR8hE5uNY1QDiPFD/THwE4K8TZXDjAMBgNVHRMEBTADAQH/MAsGA1UdDwQEAwIBBjANBgkqhkiG9w0BAQsFAAOCAQEAKB3V4HIzoiO/Ch6WMj9bLJ2FGbpkMrcb/Eq01hT5zcfKD66lVS1MlK+cRL446Z2b2KDP1oFyVs+qmrmtdwrWgD+nfe2sBmmIHo9m9KygMkEOfG3MghGTEcS+0cTKEcoHYWYyOqQh6jnedXY8Cdm4GM1hAc9MiL3/sqV8YCVSLNnkoNysmr06/rZ0MCUZPGUtRmfd0heWhrfzAKw2HLgX+RAmpOE2MZqWcjvqKGyaRiaZks4nJkP6521aC2Lgp0HhCz1j8/uQ5ldoDszCnu/iro0NAsNtudTMD+YoLQxLqdleIh6CW+illc2VdXwj7mn6J04yns9jfE2jRjW/yTLFuQ==`
 	const test_cert_file_1 = "../../caddytest/caddy.ca.cer"
@@ -357,6 +473,110 @@ func TestClientAuthenticationProvision(t *testing.T) {
 				if tt.ca.ca.CertPool() == nil {
 					t.Error("CertPool is nil, expected non-nil value")
 				}
+			}
+		})
+	}
+}
+
+func TestParseCaddyfileNestedMatcherSet(t *testing.T) {
+	for i, tc := range []struct {
+		input   string
+		expect  string
+		wantErr bool
+	}{
+		{
+			input:  `match sni example.com`,
+			expect: `{"sni":["example.com"]}`,
+		},
+		{
+			input: `match {
+				sni example.com
+				sni example.net
+			}`,
+			expect: `{"sni":["example.com","example.net"]}`,
+		},
+		{
+			input: `match {
+				remote_ip 10.0.0.0/8
+				sni example.com
+				remote_ip !10.1.2.3
+			}`,
+			expect: `{"remote_ip":{"ranges":["10.0.0.0/8"],"not_ranges":["10.1.2.3"]},"sni":["example.com"]}`,
+		},
+		{
+			input: `match {
+				sni_regexp ^a
+				sni_regexp ^b
+			}`,
+			wantErr: true,
+		},
+	} {
+		d := caddyfile.NewTestDispenser(tc.input)
+		d.Next() // consume "match"
+		matcherSet, err := ParseCaddyfileNestedMatcherSet(d)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("Test %d: expected error but got none", i)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("Test %d: unexpected error: %v", i, err)
+			continue
+		}
+
+		actual, err := json.Marshal(matcherSet)
+		if err != nil {
+			t.Fatalf("Test %d: marshaling matcher set: %v", i, err)
+		}
+		if string(actual) != tc.expect {
+			t.Errorf("Test %d: expected %s, got %s", i, tc.expect, actual)
+		}
+	}
+}
+
+func TestConnectionPolicyRejectsUnknownNames(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		policy ConnectionPolicy
+	}{
+		{"unknown curve", ConnectionPolicy{Curves: []string{"X25519"}}},
+		{"unknown protocol_min", ConnectionPolicy{ProtocolMin: "TLS1.3"}},
+		{"unknown protocol_max", ConnectionPolicy{ProtocolMax: "tls13"}},
+		{"protocol_min greater than protocol_max", ConnectionPolicy{ProtocolMin: "tls1.3", ProtocolMax: "tls1.2"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, err := caddy.ProvisionContext(&caddy.Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := (ConnectionPolicies{&tc.policy}).Provision(ctx); err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+		})
+	}
+}
+
+func TestConnectionPolicyProtocolDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		policy   ConnectionPolicy
+		min, max uint16
+	}{
+		{"both empty", ConnectionPolicy{}, tls.VersionTLS12, tls.VersionTLS13},
+		{"min only", ConnectionPolicy{ProtocolMin: "tls1.3"}, tls.VersionTLS13, tls.VersionTLS13},
+		{"max only", ConnectionPolicy{ProtocolMax: "tls1.2"}, tls.VersionTLS12, tls.VersionTLS12},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, err := caddy.ProvisionContext(&caddy.Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := (ConnectionPolicies{&tc.policy}).Provision(ctx); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := tc.policy.TLSConfig; got.MinVersion != tc.min || got.MaxVersion != tc.max {
+				t.Fatalf("got min=%x max=%x, want min=%x max=%x", got.MinVersion, got.MaxVersion, tc.min, tc.max)
 			}
 		})
 	}
