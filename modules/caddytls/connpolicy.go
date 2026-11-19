@@ -23,6 +23,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"iter"
 	"os"
 	"reflect"
 	"slices"
@@ -99,32 +100,56 @@ func (cp ConnectionPolicies) TLSConfig(ctx caddy.Context) *tls.Config {
 	// using ServerName to match policies is extremely common, especially in configs
 	// with lots and lots of different policies; we can fast-track those by indexing
 	// them by SNI, so we don't have to iterate potentially thousands of policies
-	// (TODO: this map does not account for wildcards, see if this is a problem in practice? look for reports of high connection latency with wildcard certs but low latency for non-wildcards in multi-thousand-cert deployments)
-	indexedBySNI := make(map[string]ConnectionPolicies)
+	//
+	// only a policy whose SNI matcher lists exact names can be indexed, since it
+	// can't match any other ServerName; a policy with no SNI matcher, or one whose
+	// SNI matcher uses a wildcard or a placeholder, may match any name, so it has
+	// to stay in the candidate set for every lookup (in its original position) to
+	// preserve first-match order, otherwise an indexed exact-name policy would
+	// shadow an earlier catch-all drop or a remote_ip/wildcard restriction
+	indexedBySNI := make(map[string][]int)
+	var unindexed []int
 	if len(cp) > 30 {
-		for _, p := range cp {
+	indexLoop:
+		for i, p := range cp {
 			for _, m := range p.matchers {
-				if sni, ok := m.(MatchServerName); ok {
-					for _, sniName := range sni {
-						// index for fast lookups during handshakes
-						indexName := asciiServerNameForMatch(sniName)
-						indexedBySNI[indexName] = append(indexedBySNI[indexName], p)
-					}
+				// provisioned matchers are pointers, but a value may be used
+				// when policies are built programmatically, so accept both
+				var sni MatchServerName
+				switch v := m.(type) {
+				case *MatchServerName:
+					sni = *v
+				case MatchServerName:
+					sni = v
+				default:
+					continue
 				}
+				if slices.ContainsFunc(sni, func(name string) bool {
+					return strings.ContainsAny(name, "*{")
+				}) {
+					continue
+				}
+				for _, sniName := range sni {
+					// index for fast lookups during handshakes
+					indexName := asciiServerNameForMatch(sniName)
+					indexedBySNI[indexName] = append(indexedBySNI[indexName], i)
+				}
+				continue indexLoop
 			}
+			unindexed = append(unindexed, i)
 		}
 	}
 
 	getConfigForClient := func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 		// filter policies by SNI first, if possible, to speed things up
 		// when there may be lots of policies
-		possiblePolicies := cp
-		if indexedPolicies, ok := indexedBySNI[asciiServerNameForMatch(hello.ServerName)]; ok {
-			possiblePolicies = indexedPolicies
+		possiblePolicies := slices.Values(cp)
+		if indexed, ok := indexedBySNI[asciiServerNameForMatch(hello.ServerName)]; ok {
+			possiblePolicies = policiesInOrder(cp, indexed, unindexed)
 		}
 
 	policyLoop:
-		for _, pol := range possiblePolicies {
+		for pol := range possiblePolicies {
 			for _, matcher := range pol.matchers {
 				if !matcher.Match(hello) {
 					continue policyLoop
@@ -169,15 +194,43 @@ func (cp ConnectionPolicies) TLSConfig(ctx caddy.Context) *tls.Config {
 				}
 			}
 
-			tlsCfg.GetEncryptedClientHelloKeys = func(chi *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+			getECHKeys := func(chi *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
 				tlsApp.EncryptedClientHello.configsMu.RLock()
 				defer tlsApp.EncryptedClientHello.configsMu.RUnlock()
 				return tlsApp.EncryptedClientHello.stdlibReady, nil
+			}
+
+			// crypto/tls decrypts the ClientHello with the keys from this config,
+			// but builds the retry configs it sends when ECH is rejected from the
+			// config returned by GetConfigForClient, so both need the keys.
+			tlsCfg.GetEncryptedClientHelloKeys = getECHKeys
+			for _, p := range cp {
+				if p.TLSConfig != nil && p.TLSConfig.GetEncryptedClientHelloKeys == nil {
+					p.TLSConfig.GetEncryptedClientHelloKeys = getECHKeys
+				}
 			}
 		}
 	}
 
 	return tlsCfg
+}
+
+// policiesInOrder yields the policies of cp at the indices in a and b, both of
+// which must be sorted ascending, in the order they appear in cp.
+func policiesInOrder(cp ConnectionPolicies, a, b []int) iter.Seq[*ConnectionPolicy] {
+	return func(yield func(*ConnectionPolicy) bool) {
+		for len(a) > 0 || len(b) > 0 {
+			var i int
+			if len(b) == 0 || (len(a) > 0 && a[0] < b[0]) {
+				i, a = a[0], a[1:]
+			} else {
+				i, b = b[0], b[1:]
+			}
+			if !yield(cp[i]) {
+				return
+			}
+		}
+	}
 }
 
 // ConnectionPolicy specifies the logic for handling a TLS handshake.
@@ -353,7 +406,10 @@ func (p *ConnectionPolicy) buildStandardTLSConfig(ctx caddy.Context) error {
 	// add all the curve preferences in order, without duplicates
 	curvesAdded := make(map[tls.CurveID]struct{})
 	for _, curveName := range p.Curves {
-		curveID := SupportedCurves[curveName]
+		curveID, ok := SupportedCurves[curveName]
+		if !ok {
+			return fmt.Errorf("unsupported curve: %s", curveName)
+		}
 		if _, ok := curvesAdded[curveID]; !ok {
 			curvesAdded[curveID] = struct{}{}
 			cfg.CurvePreferences = append(cfg.CurvePreferences, curveID)
@@ -367,14 +423,23 @@ func (p *ConnectionPolicy) buildStandardTLSConfig(ctx caddy.Context) error {
 	}
 
 	// min and max protocol versions
-	if (p.ProtocolMin != "" && p.ProtocolMax != "") && p.ProtocolMin > p.ProtocolMax {
-		return fmt.Errorf("protocol min (%x) cannot be greater than protocol max (%x)", p.ProtocolMin, p.ProtocolMax)
-	}
 	if p.ProtocolMin != "" {
-		cfg.MinVersion = SupportedProtocols[p.ProtocolMin]
+		minVersion, ok := SupportedProtocols[p.ProtocolMin]
+		if !ok {
+			return fmt.Errorf("unsupported protocol_min: %s", p.ProtocolMin)
+		}
+		cfg.MinVersion = minVersion
 	}
 	if p.ProtocolMax != "" {
-		cfg.MaxVersion = SupportedProtocols[p.ProtocolMax]
+		maxVersion, ok := SupportedProtocols[p.ProtocolMax]
+		if !ok {
+			return fmt.Errorf("unsupported protocol_max: %s", p.ProtocolMax)
+		}
+		cfg.MaxVersion = maxVersion
+	}
+	if cfg.MinVersion > cfg.MaxVersion {
+		return fmt.Errorf("protocol min (%s) cannot be greater than protocol max (%s)",
+			ProtocolName(cfg.MinVersion), ProtocolName(cfg.MaxVersion))
 	}
 
 	// client authentication
@@ -631,9 +696,12 @@ type ClientAuthentication struct {
 	// `verify_if_given` | Ask clients for a certificate; allow even if there isn't one, but verify it if there is
 	// `require_and_verify` | Require clients to present a valid certificate that is verified
 	//
-	// The default mode is `require_and_verify` if any
-	// TrustedCACerts or TrustedCACertPEMFiles or TrustedLeafCerts
-	// are provided; otherwise, the default mode is `require`.
+	// The `verify_if_given` and `require_and_verify` modes need a
+	// trust pool (`ca`). To verify against the system's root
+	// certificates, use the `tls.ca_pool.source.system` module.
+	//
+	// The default mode is `require_and_verify` if a trust pool is
+	// provided; otherwise, the default mode is `require`.
 	Mode string `json:"mode,omitempty"`
 
 	existingVerifyPeerCert func([][]byte, [][]*x509.Certificate) error
@@ -650,7 +718,8 @@ type ClientAuthentication struct {
 //	}
 //
 // If `mode` is not provided, it defaults to `require_and_verify` if `trust_pool` is provided.
-// Otherwise, it defaults to `require`.
+// Otherwise, it defaults to `require`. The `verify_if_given` and `require_and_verify` modes
+// need a `trust_pool`; use `trust_pool system` to verify against the system roots.
 func (ca *ClientAuthentication) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.NextArg() {
 		// consume any tokens on the same line, if any.
@@ -856,12 +925,17 @@ func (clientauth *ClientAuthentication) ConfigureTLSConfig(cfg *tls.Config) erro
 		// otherwise, set a safe default mode
 		if len(clientauth.TrustedCACerts) > 0 ||
 			len(clientauth.TrustedCACertPEMFiles) > 0 ||
-			len(clientauth.TrustedLeafCerts) > 0 ||
 			clientauth.CARaw != nil || clientauth.ca != nil {
 			cfg.ClientAuth = tls.RequireAndVerifyClientCert
 		} else {
 			cfg.ClientAuth = tls.RequireAnyClientCert
 		}
+	}
+
+	// without ClientCAs, Go verifies client certs against the system roots
+	verifyMode := cfg.ClientAuth == tls.VerifyClientCertIfGiven || cfg.ClientAuth == tls.RequireAndVerifyClientCert
+	if verifyMode && clientauth.ca == nil {
+		return fmt.Errorf("client auth modes verify_if_given and require_and_verify need a trust pool; use the 'system' trust pool to verify against system roots")
 	}
 
 	// enforce CA verification by adding CA certs to the ClientCAs pool
@@ -907,6 +981,12 @@ func (clientauth *ClientAuthentication) verifyConnection(cs tls.ConnectionState)
 		if err := clientauth.existingVerifyPeerCert(rawCerts, cs.VerifiedChains); err != nil {
 			return err
 		}
+	}
+
+	// crypto/tls has already enforced whether the mode requires a
+	// certificate, so the verifiers only check one that was presented
+	if len(rawCerts) == 0 {
+		return nil
 	}
 	for _, verifier := range clientauth.verifiers {
 		if err := verifier.VerifyClientCertificate(rawCerts, cs.VerifiedChains); err != nil {
@@ -1072,7 +1152,8 @@ type LeafCertificateLoader interface {
 }
 
 // ClientCertificateVerifier is a type which verifies client certificates.
-// It is called during verifyPeerCertificate in the TLS handshake.
+// It is called during verifyConnection in the TLS handshake, only when
+// the client presented a certificate.
 type ClientCertificateVerifier interface {
 	VerifyClientCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error
 }
@@ -1097,6 +1178,10 @@ var (
 func ParseCaddyfileNestedMatcherSet(d *caddyfile.Dispenser) (caddy.ModuleMap, error) {
 	matcherMap := make(map[string]ConnectionMatcher)
 
+	// in case there are multiple instances of the same matcher, concatenate
+	// their tokens (we expect that UnmarshalCaddyfile should be able to
+	// handle more than one segment); otherwise, we'd overwrite other
+	// instances of the matcher in this set
 	tokensByMatcherName := make(map[string][]caddyfile.Token)
 	for nesting := d.Nesting(); d.NextArg() || d.NextBlock(nesting); {
 		matcherName := d.Val()
@@ -1104,10 +1189,15 @@ func ParseCaddyfileNestedMatcherSet(d *caddyfile.Dispenser) (caddy.ModuleMap, er
 	}
 
 	for matcherName, tokens := range tokensByMatcherName {
-		dd := caddyfile.NewDispenser(tokens)
-		dd.Next() // consume wrapper name
-
-		unm, err := caddyfile.UnmarshalModule(dd, "tls.handshake_match."+matcherName)
+		mod, err := caddy.GetModule("tls.handshake_match." + matcherName)
+		if err != nil {
+			return nil, d.Errf("getting matcher module '%s': %v", matcherName, err)
+		}
+		unm, ok := mod.New().(caddyfile.Unmarshaler)
+		if !ok {
+			return nil, d.Errf("matcher module '%s' is not a Caddyfile unmarshaler", matcherName)
+		}
+		err = unm.UnmarshalCaddyfile(caddyfile.NewDispenser(tokens))
 		if err != nil {
 			return nil, err
 		}
