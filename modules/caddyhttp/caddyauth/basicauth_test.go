@@ -19,9 +19,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
+	"golang.org/x/sync/singleflight"
 )
 
 // testBasicAuthHash is a bcrypt hash (cost 4) of the plaintext "correct horse".
@@ -99,6 +102,39 @@ func TestBasicAuthProvisionRejectsBracedPasswordInsteadOfRewritingIt(t *testing.
 	}
 }
 
+func TestBasicAuthProvisionRejectsUsernamesThatCollideAfterExpansion(t *testing.T) {
+	t.Setenv("CADDYTEST_BASICAUTH_X", "carol")
+	t.Setenv("CADDYTEST_BASICAUTH_Y", "carol")
+	t.Setenv("CADDYTEST_BASICAUTH_Z", "dave")
+
+	for _, tc := range []struct {
+		first, second string
+		wantErr       bool
+	}{
+		{"carol", "carol", true},
+		{"{env.CADDYTEST_BASICAUTH_X}", "{env.CADDYTEST_BASICAUTH_Y}", true},
+		{"carol", "{env.CADDYTEST_BASICAUTH_Y}", true},
+		{"{env.CADDYTEST_BASICAUTH_X}", "{env.CADDYTEST_BASICAUTH_X}", true},
+		{"{env.CADDYTEST_BASICAUTH_X}", "{env.CADDYTEST_BASICAUTH_Z}", false},
+	} {
+		hba := HTTPBasicAuth{
+			AccountList: []Account{
+				{Username: tc.first, Password: testBasicAuthHash},
+				{Username: tc.second, Password: testBasicAuthHash},
+			},
+		}
+		ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+		err := hba.Provision(ctx)
+		cancel()
+		if tc.wantErr && err == nil {
+			t.Errorf("%s + %s: expected a duplicate username error, got accounts %q", tc.first, tc.second, accountUsernames(hba))
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("%s + %s: unexpected error: %v", tc.first, tc.second, err)
+		}
+	}
+}
+
 func accountUsernames(hba HTTPBasicAuth) []string {
 	names := make([]string, 0, len(hba.Accounts))
 	for name := range hba.Accounts {
@@ -106,4 +142,101 @@ func accountUsernames(hba HTTPBasicAuth) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func newCachedBasicAuth(t *testing.T) HTTPBasicAuth {
+	t.Helper()
+	hba := HTTPBasicAuth{
+		AccountList: []Account{{Username: "alice", Password: testBasicAuthHash}},
+		HashCache:   new(Cache),
+	}
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	t.Cleanup(cancel)
+	if err := hba.Provision(ctx); err != nil {
+		t.Fatalf("provisioning failed: %v", err)
+	}
+	return hba
+}
+
+func TestBasicAuthHashCacheDoesNotModifyStoredHash(t *testing.T) {
+	hba := newCachedBasicAuth(t)
+	account := hba.Accounts["alice"]
+
+	// inspect the full backing array, including any spare capacity
+	before := append([]byte(nil), account.password[:cap(account.password)]...)
+
+	if _, err := hba.correctPassword(account, []byte("abcd")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	after := account.password[:cap(account.password)]
+	if string(before) != string(after) {
+		t.Fatalf("stored password hash buffer was modified while building the cache key")
+	}
+}
+
+func TestBasicAuthHashCacheConcurrentRequests(t *testing.T) {
+	hba := newCachedBasicAuth(t)
+
+	passwords := []string{"correct horse", "aaa", "bbb", "ccc"}
+	var wg sync.WaitGroup
+	for i := range 64 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pw := passwords[i%len(passwords)]
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.SetBasicAuth("alice", pw)
+			_, ok, _ := hba.Authenticate(httptest.NewRecorder(), req)
+			if want := pw == "correct horse"; ok != want {
+				t.Errorf("password %q: authenticated=%v, want %v", pw, ok, want)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+type countingComparer struct {
+	calls atomic.Int64
+}
+
+func (c *countingComparer) Compare(hashed, plaintext []byte) (bool, error) {
+	c.calls.Add(1)
+	return string(hashed) == string(plaintext), nil
+}
+
+func TestBasicAuthHashCacheOnlyCachesSuccess(t *testing.T) {
+	comparer := new(countingComparer)
+	hba := HTTPBasicAuth{
+		Accounts:     map[string]Account{"alice": {Username: "alice", password: []byte("secret")}},
+		Hash:         comparer,
+		fakePassword: []byte("dummy"),
+		HashCache:    &Cache{cache: make(map[string]bool), mu: new(sync.RWMutex), g: new(singleflight.Group)},
+	}
+	for i, username := range []string{"missing-prime", "missing-probe", "alice", "missing-probe", "alice"} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.SetBasicAuth(username, "wrong")
+		_, ok, err := hba.Authenticate(httptest.NewRecorder(), req)
+		if err != nil || ok {
+			t.Fatalf("unexpected authentication result for %q: %v, %v", username, ok, err)
+		}
+		if got := comparer.calls.Load(); got != int64(i+1) {
+			t.Fatalf("comparison skipped for %q: got %d calls, want %d", username, got, i+1)
+		}
+	}
+	if len(hba.HashCache.cache) != 0 {
+		t.Fatal("unsuccessful comparisons populated the cache")
+	}
+	before := comparer.calls.Load()
+	for range 2 {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.SetBasicAuth("alice", "secret")
+		_, ok, err := hba.Authenticate(httptest.NewRecorder(), req)
+		if err != nil || !ok {
+			t.Fatalf("valid credentials rejected: %v, %v", ok, err)
+		}
+	}
+	if got := comparer.calls.Load() - before; got != 1 {
+		t.Fatalf("successful comparison was not cached: %d calls", got)
+	}
 }

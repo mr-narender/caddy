@@ -53,7 +53,7 @@ Here are some of the expectations we have of contributors:
 
 - **Pull requests may still get closed.** The longer a PR stays open and idle, the more likely it is to be closed. If we haven't reviewed it in a while, it probably means the change is not a priority. Please don't take this personally, we're trying to balance a lot of tasks! If nobody else has commented or reacted to the PR, it likely means your change is useful only to you. The reality is this happens quite a lot. We don't tend to accept PRs that aren't generally helpful. For these reasons or others, the PR may get closed even after a review. We are not obligated to accept all proposed changes, even if the best justification we can give is something vague like, "It doesn't sit right." Sometimes PRs are just the wrong thing or the wrong time. Because it is open source, you can always build your own modified version of Caddy with a change you need, even if we reject it in the official repo. Plus, because Caddy is extensible, it's possible your feature could make a great plugin instead!
 
-- **You certify that you wrote and comprehend the code you submit.** The Caddy project welcomes original contributions that comply with [our CLA](https://cla-assistant.io/caddyserver/caddy), meaning that authors must be able to certify that they created or have rights to the code they are contributing. In addition, we require that code is not simply copy-pasted from Q/A sites or AI language models without full comprehension and rigorous testing. In other words: contributors are allowed to refer to communities for assistance and use AI tools such as language models for inspiration, but code which originates from or is assisted by these resources MUST be:
+- **You certify that you wrote and comprehend the code you submit.** The Caddy project welcomes original contributions that comply with [our CLA](https://caddyserver.com/cla/), meaning that authors must be able to certify that they created or have rights to the code they are contributing. In addition, we require that code is not simply copy-pasted from Q/A sites or AI language models without full comprehension and rigorous testing. In other words: contributors are allowed to refer to communities for assistance and use AI tools such as language models for inspiration, but code which originates from or is assisted by these resources MUST be:
 
 	- Licensed for you to freely share
 	- Fully comprehended by you (be able to explain every line of code)
@@ -151,7 +151,8 @@ Caddy's documentation is available at [https://caddyserver.com/docs](https://cad
 
 Note that third-party module documentation is not hosted by the Caddy website, other than basic usage examples. They are managed by the individual module authors, and you will have to contact them to change their documentation.
 
-Our documentation is scoped to the Caddy project only: it is not for describing how other software or systems work, even if they relate to Caddy or web servers. That kind of content [can be found in our community wiki](https://caddy.community/c/wiki/13), however.
+Our documentation is scoped to the Caddy project only: it is not for describing how other software or systems work, even if they relate to Caddy or web servers. That kind of content [can be found in our community wiki](https://caddy.community/c/wiki/13), however
+
 
 ## Collaborator Instructions
 
@@ -184,6 +185,13 @@ Collaborators have push rights to the repository. We grant this permission after
 	- [Best Practices for Maintainers](https://opensource.guide/best-practices/)
 	- [Shrinking Code Review](https://alexgaynor.net/2015/dec/29/shrinking-code-review/)
 
+## Proposing a release
+
+Our release flow is unique to avoid new releases from relying on any one maintainer, and from new releases being tagged prematurely. Authorized maintainers can propose a release by using the [Release Proposal](https://github.com/caddyserver/caddy/actions/workflows/release-proposal.yml) CI workflow. This has manual triggers only, and requires typing the desired tag and the commit SHA at which to tag the release.
+
+The workflow then automatically does some checks and submits an empty PR. When the PR is approved by sufficient authorized maintainers to form a quorum, the PR is automatically closed, and the release workflow begins.
+
+Maintainers must not push tags to trigger releases. Note that only certain maintainers may participate in the release proposal process.
 
 
 ## Values (WIP)
